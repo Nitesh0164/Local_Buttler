@@ -1,7 +1,9 @@
 package com.example.jaipurtravel.service.impl;
 
 import com.example.jaipurtravel.dto.request.ChatMessageRequest;
+import com.example.jaipurtravel.dto.request.GeneratePlannerRequest;
 import com.example.jaipurtravel.dto.response.*;
+import com.example.jaipurtravel.dto.response.PlannerResponse.*;
 import com.example.jaipurtravel.entity.*;
 import com.example.jaipurtravel.exception.ResourceNotFoundException;
 import com.example.jaipurtravel.integration.HuggingFaceClient;
@@ -32,6 +34,7 @@ public class ChatServiceImpl implements ChatService {
     private final WeatherService weatherService;
     private final HuggingFaceClient huggingFaceClient;
     private final HotelService hotelService;
+    private final PlannerService plannerService;
 
     @Override
     @Transactional
@@ -85,7 +88,7 @@ public class ChatServiceImpl implements ChatService {
             case PLACE_INFO -> handlePlaceQuery(req.getMessage());
             case ROUTE_INFO -> handleRouteQuery(req.getMessage());
             case WEATHER_INFO -> handleWeatherQuery(req.getMessage(), req.getCity());
-            case ITINERARY_INFO -> handleItineraryQuery(req.getMessage());
+            case ITINERARY_INFO -> handleItineraryQuery(req);
             case TRIP_INFO -> handleTripQuery(user);
             case FOOD_INFO -> handleFoodQuery(req.getMessage());
             case HOTEL_INFO -> handleHotelQuery(req.getMessage());
@@ -260,35 +263,245 @@ public class ChatServiceImpl implements ChatService {
                 List.of("What should I wear?", "Best time to visit forts?", "Plan a trip considering weather"), null);
     }
 
-    private ChatResult handleItineraryQuery(String message) {
+    private ChatResult handleItineraryQuery(ChatMessageRequest req) {
+        String message = req.getMessage();
         String lower = message.toLowerCase();
-        // Try to extract days/budget from message
-        int days = extractNumber(lower, "day");
-        if (days <= 0)
-            days = 2;
 
-        long placeCount = placeRepo.count();
+        // 1. Extract days from message or request
+        int days = req.getDays() != null && req.getDays() > 0 ? req.getDays() : extractNumber(lower, "day");
+        if (days <= 0) days = 2;
+        if (days > 14) days = 14;
+
+        // 2. Extract budget
+        BigDecimal budget = req.getBudget();
+        if (budget == null || budget.compareTo(BigDecimal.ZERO) <= 0) {
+            budget = extractBudget(lower);
+        }
+
+        // 3. Extract interests
+        List<String> interests = req.getInterests() != null && !req.getInterests().isEmpty()
+                ? req.getInterests() : extractInterests(lower);
+
+        // 4. Extract travel style
+        String travelStyle = req.getTravelStyle();
+        if (travelStyle == null || travelStyle.isBlank()) {
+            travelStyle = extractTravelStyle(lower);
+        }
+
+        // 5. Extract group type
+        String groupType = req.getGroupType();
+        if (groupType == null || groupType.isBlank()) {
+            groupType = extractGroupType(lower);
+        }
+
+        // 6. Build planner request and generate
+        GeneratePlannerRequest planReq = new GeneratePlannerRequest();
+        planReq.setCity("jaipur");
+        planReq.setDays(days);
+        planReq.setBudget(budget);
+        planReq.setInterests(interests);
+        planReq.setTravelStyle(travelStyle);
+        planReq.setGroupType(groupType);
+
+        try {
+            PlannerResponse plan = plannerService.generateItinerary(planReq);
+            String reply = formatPlannerResponse(plan, budget);
+            List<String> suggestions = List.of(
+                    "Make it more budget-friendly",
+                    "Add more food spots",
+                    "Show me a heritage-focused version",
+                    "What should I pack?");
+            Map<String, Object> related = new LinkedHashMap<>();
+            related.put("plannerResponse", plan);
+            return new ChatResult(reply, "DB", suggestions, related);
+        } catch (Exception e) {
+            log.error("Planner failed for chat itinerary request, using fallback", e);
+            return buildFallbackItinerary(days, travelStyle, groupType);
+        }
+    }
+
+    private String formatPlannerResponse(PlannerResponse plan, BigDecimal userBudget) {
         StringBuilder sb = new StringBuilder();
-        sb.append("📋 I can help you plan! We have **").append(placeCount).append(" places** in our database.\n\n");
-        sb.append("Use the **Itinerary Planner** endpoint:\n");
-        sb.append("```\nPOST /api/planner/generate\n{\n");
-        sb.append("  \"city\": \"jaipur\",\n");
-        sb.append("  \"days\": ").append(days).append(",\n");
-        sb.append("  \"interests\": [\"Heritage\", \"Food\"],\n");
-        sb.append("  \"travelStyle\": \"comfort\"\n}\n```\n\n");
-        sb.append("Or tell me more about your preferences and I'll help refine the plan!");
+
+        // Title and summary
+        sb.append("## 🗺️ ").append(plan.getTitle()).append("\n\n");
+        sb.append(plan.getSummary()).append("\n\n");
+
+        // Budget overview
+        PlannerBudget b = plan.getEstimatedBudget();
+        if (b != null) {
+            sb.append("### 💰 Estimated Budget\n");
+            sb.append("- **Total:** ₹").append(b.getTotalEstimatedCost().toPlainString()).append("\n");
+            sb.append("- **Per day:** ₹").append(b.getPerDayCost().toPlainString()).append("\n");
+            sb.append("- Entry fees: ₹").append(b.getPlacesSpend().toPlainString())
+              .append(" | Food: ₹").append(b.getFoodSpend().toPlainString())
+              .append(" | Transport: ₹").append(b.getTransportSpend().toPlainString()).append("\n");
+            if (b.getBudgetVerdict() != null) {
+                sb.append("- 📊 ").append(b.getBudgetVerdict()).append("\n");
+            }
+            sb.append("\n");
+        }
+
+        // Day-wise itinerary
+        for (PlannerDay day : plan.getDayPlans()) {
+            sb.append("### 📅 Day ").append(day.getDayNumber()).append(": ").append(day.getTheme()).append("\n");
+            if (day.getEstimatedDayCost() != null) {
+                sb.append("*Estimated day cost: ₹").append(day.getEstimatedDayCost().toPlainString()).append("*\n\n");
+            }
+
+            // Group stops by time of day
+            Map<String, List<PlannerStop>> byTime = new LinkedHashMap<>();
+            for (PlannerStop stop : day.getStops()) {
+                String time = stop.getSuggestedTimeOfDay() != null ? stop.getSuggestedTimeOfDay() : "anytime";
+                byTime.computeIfAbsent(capitalize(time), k -> new ArrayList<>()).add(stop);
+            }
+
+            for (var entry : byTime.entrySet()) {
+                sb.append("**").append(getTimeEmoji(entry.getKey())).append(" ").append(entry.getKey()).append(":**\n");
+                for (PlannerStop stop : entry.getValue()) {
+                    sb.append("- **").append(stop.getPlaceName()).append("**");
+                    if (stop.getArea() != null) sb.append(" (").append(stop.getArea()).append(")");
+                    if (stop.getEstimatedSpend() != null && stop.getEstimatedSpend().compareTo(BigDecimal.ZERO) > 0) {
+                        sb.append(" — ~₹").append(stop.getEstimatedSpend().toPlainString());
+                    }
+                    sb.append("\n");
+                    if (stop.getDuration() != null) sb.append("  ⏱️ ").append(stop.getDuration()).append("\n");
+                    if (stop.getTip() != null) sb.append("  💡 ").append(stop.getTip()).append("\n");
+                }
+                sb.append("\n");
+            }
+
+            if (day.getNotes() != null && !day.getNotes().isEmpty()) {
+                for (String note : day.getNotes()) {
+                    sb.append("📌 ").append(note).append("\n");
+                }
+                sb.append("\n");
+            }
+        }
+
+        // Transport tips
+        if (plan.getTransportSummary() != null && !plan.getTransportSummary().isEmpty()) {
+            sb.append("### 🚌 Transport Tips\n");
+            for (String tip : plan.getTransportSummary()) {
+                sb.append("- ").append(tip).append("\n");
+            }
+            sb.append("\n");
+        }
+
+        // General notes
+        if (plan.getNotes() != null && !plan.getNotes().isEmpty()) {
+            sb.append("### 📝 Good to Know\n");
+            for (String note : plan.getNotes()) {
+                sb.append("- ").append(note).append("\n");
+            }
+        }
+
+        return sb.toString();
+    }
+
+    private String getTimeEmoji(String time) {
+        if (time == null) return "🕐";
+        String lower = time.toLowerCase();
+        if (lower.contains("morning")) return "🌅";
+        if (lower.contains("afternoon")) return "☀️";
+        if (lower.contains("evening")) return "🌇";
+        if (lower.contains("night")) return "🌙";
+        return "🕐";
+    }
+
+    private String capitalize(String s) {
+        if (s == null || s.isEmpty()) return s;
+        return s.substring(0, 1).toUpperCase() + s.substring(1);
+    }
+
+    private BigDecimal extractBudget(String lower) {
+        // Match patterns like "₹5000", "5000/day", "under 3000", "rs 5000"
+        try {
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("(?:₹|rs\\.?|inr)?\\s*(\\d{3,6})")
+                    .matcher(lower);
+            if (m.find()) {
+                return new BigDecimal(m.group(1));
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private List<String> extractInterests(String lower) {
+        List<String> interests = new ArrayList<>();
+        Map<String, String> keywordMap = Map.ofEntries(
+                Map.entry("heritage", "Heritage"), Map.entry("historical", "Heritage"),
+                Map.entry("fort", "Heritage"), Map.entry("palace", "Heritage"),
+                Map.entry("food", "Food"), Map.entry("cafe", "Cafes"),
+                Map.entry("restaurant", "Food"), Map.entry("shopping", "Shopping"),
+                Map.entry("market", "Shopping"), Map.entry("bazaar", "Shopping"),
+                Map.entry("nightlife", "Nightlife"), Map.entry("bar", "Bars"),
+                Map.entry("museum", "Heritage"), Map.entry("temple", "Heritage")
+        );
+        Set<String> added = new HashSet<>();
+        for (var entry : keywordMap.entrySet()) {
+            if (lower.contains(entry.getKey()) && added.add(entry.getValue())) {
+                interests.add(entry.getValue());
+            }
+        }
+        if (interests.isEmpty()) {
+            interests.add("Heritage");
+            interests.add("Food");
+        }
+        return interests;
+    }
+
+    private String extractTravelStyle(String lower) {
+        if (lower.contains("budget") || lower.contains("cheap")) return "budget";
+        if (lower.contains("premium") || lower.contains("luxury")) return "premium";
+        if (lower.contains("relax")) return "relaxed";
+        if (lower.contains("family")) return "family-friendly";
+        if (lower.contains("fast") || lower.contains("packed")) return "fast-paced";
+        return "comfort";
+    }
+
+    private String extractGroupType(String lower) {
+        if (lower.contains("family") || lower.contains("kid") || lower.contains("child")) return "family";
+        if (lower.contains("couple") || lower.contains("romantic")) return "couple";
+        if (lower.contains("solo") || lower.contains("alone")) return "solo";
+        if (lower.contains("friend")) return "friends";
+        return null;
+    }
+
+    private ChatResult buildFallbackItinerary(int days, String style, String group) {
+        List<Place> places = placeRepo.findFeaturedByCity("jaipur");
+        if (places.isEmpty()) places = placeRepo.findAll();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("## 🗺️ Your ").append(days).append("-Day Jaipur Itinerary\n\n");
+        sb.append("Here's a curated plan based on Jaipur's top-rated spots:\n\n");
+
+        int perDay = Math.min(4, Math.max(1, places.size() / Math.max(days, 1)));
+        int idx = 0;
+        for (int d = 1; d <= days && idx < places.size(); d++) {
+            sb.append("### 📅 Day ").append(d).append("\n");
+            for (int s = 0; s < perDay && idx < places.size(); s++, idx++) {
+                Place p = places.get(idx);
+                sb.append("- **").append(p.getName()).append("**");
+                if (p.getArea() != null) sb.append(" (").append(p.getArea()).append(")");
+                if (p.getEntryFee() != null) sb.append(" — ₹").append(p.getEntryFee());
+                sb.append("\n");
+            }
+            sb.append("\n");
+        }
+        sb.append("💡 Start early (8 AM) to make the most of your day!\n");
+        sb.append("🚌 Use city buses or auto-rickshaws to get around.\n");
 
         return new ChatResult(sb.toString(), "DB",
-                List.of("Plan a 2-day budget trip", "What are the must-see places?", "Suggest a family itinerary"),
-                null);
+                List.of("Tell me more about Day 1", "Add food spots", "Make it budget-friendly"), null);
     }
 
     private ChatResult handleTripQuery(User user) {
         List<com.example.jaipurtravel.entity.Trip> trips = tripRepo.findByUserOrderByCreatedAtDesc(user);
         if (trips.isEmpty()) {
             return new ChatResult("You don't have any saved trips yet. " +
-                    "Use the **Itinerary Planner** to generate one and save it!", "DB",
-                    List.of("Plan a new trip", "Show me popular places"), null);
+                    "Let me help you plan one! Just tell me how many days and your interests.", "DB",
+                    List.of("Plan a 2-day trip", "Show me popular places"), null);
         }
 
         StringBuilder sb = new StringBuilder();
@@ -300,7 +513,7 @@ public class ChatServiceImpl implements ChatService {
                     .append(" | ").append(trip.getCreatedAt().toLocalDate())
                     .append("\n");
         }
-        sb.append("\nUse `GET /api/trips/{id}` to view full details.");
+        sb.append("\nYou can view full details from the **My Trips** section.");
 
         Map<String, Object> related = new LinkedHashMap<>();
         related.put("tripCount", trips.size());
